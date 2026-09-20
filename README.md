@@ -142,10 +142,13 @@ DAG，工作器原子领取「所有前置均已成功」的任务，凭借唯�
   一个未确认批次**：租约未过期时重复 `poll` 逐字节原样回放该批次（同令牌、同事件集，
   忽略新的 `limit`/`lease_seconds`）；租约过期后旧批次失效，下次 `poll` 以**新随机
   令牌**和新租约重新投递同一窗口（游标未推进，未确认事件原样重投，绝不跳过）。
-  `POST /subscriptions/{id}/ack` 仅接受**当前**批次令牌，把游标推进到该批最后一条
-  `sequence`；令牌旧（批次已过期重投）、错误或没有在途批次一律返回 **409**
-  （`invalid_delivery_token` / `no_pending_batch`），游标保持不动，因此不可能越过
-  任何未确认事件。订阅、在途批次（含令牌、租约与首次响应原文）与游标全部持久化在
+  `POST /subscriptions/{id}/ack` 仅接受**当前**批次令牌且租约仍有效，把游标推进到
+  该批最后一条 `sequence`；令牌旧（批次已过期重投）或错误返回 **409**
+  `invalid_delivery_token`，没有在途批次返回 **409** `no_pending_batch`，
+  令牌正确但租约已到期（`lease_expires_at` ≤ 服务端当前时刻，**边界相等也算到期**）
+  返回 **409** `delivery_expired`——该检查与游标推进在同一写事务内完成，
+  过期确认不推进游标、不删除在途批次，后续 `poll` 仍会删旧批次并以新令牌重投，
+  因此不可能越过任何未确认事件。订阅、在途批次（含令牌、租约与首次响应原文）与游标全部持久化在
   SQLite 中，**重启后语义不变**（未过期批次仍原样回放，其令牌仍可确认）。另有
   `GET /subscriptions`（可按 `dag_id` 过滤）与 `GET /subscriptions/{id}`
   （含在途批次及其 `expired` 状态）查询。该模块只复用 `events.sequence`，
@@ -765,7 +768,7 @@ curl -s -X POST http://localhost:8000/subscriptions/$SID/poll \
   同一个 `delivery_token`、同一批事件，不会发出第二批。
 - **租约过期后重新投递**：过期后 `poll` 删除旧批次并以**新随机令牌**重发同一窗口
   （仍从已确认游标之后开始）。旧令牌此后 `ack` 返回 `409 invalid_delivery_token`。
-- **确认只推进当前批次**：
+- **确认只推进当前批次（租约校验与游标推进同一写事务）**：
 
 ```bash
 curl -s -X POST http://localhost:8000/subscriptions/$SID/ack \
@@ -773,10 +776,12 @@ curl -s -X POST http://localhost:8000/subscriptions/$SID/ack \
 # {"subscription_id":"9f2a…","committed_sequence":1}
 ```
 
-  只有当前在途批次的令牌能确认，游标恰好推进到该批最后一条 `sequence`；
+  只有当前在途批次、且租约仍有效的令牌能确认，游标恰好推进到该批最后一条 `sequence`；
   错误/旧令牌返回 `409 invalid_delivery_token`，没有在途批次（已确认、从未 poll、
-  过期后尚未重投）返回 `409 no_pending_batch`，且两者都不推进游标——未确认的事件
-  永远不会被越过。
+  过期后尚未重投）返回 `409 no_pending_batch`，令牌正确但租约已到期
+  （`lease_expires_at` ≤ 当前时刻，**边界相等也算到期**）返回
+  `409 delivery_expired`——三种失败都不推进游标、也不改动在途批次行，
+  过期批次留待下次 `poll` 删除并以新令牌重投，未确认的事件永远不会被越过。
 - 追平事件流后 `poll` 返回空批次：`events: []`、`delivery_token: null`，
   不占用在途槽位；之后有新事件时可直接再次 `poll`。
 - 订阅与在途批次持久化在 `task-data` 卷中：服务/容器重启后，未过期批次仍原样回放、
@@ -1012,7 +1017,10 @@ OpenAPI 文档包含取消接口）、
 升序返回下一批事件与随机 delivery_token、limit 1～100 与正数 lease_seconds 校验、
 租约内重复 poll 逐字节回放同一批次、租约过期后以新令牌重投同一窗口且旧令牌 ack
 返回 409、ack 仅认当前令牌并把游标推进到该批最后一条 sequence、无在途批次/错误
-令牌返回 409 且游标不动、空批次无令牌不占槽位、不可能越过未确认事件、订阅列表与
+令牌返回 409 且游标不动、租约到期（含 lease_expires_at 与当前时刻相等的边界）后
+即便令牌正确也返回 409 delivery_expired 且游标与在途记录均不变、过期确认后下次
+poll 删旧批次以新令牌重投、重投后旧令牌仍 409 invalid_delivery_token、空批次无
+令牌不占槽位、不可能越过未确认事件、订阅列表与
 详情含在途 expired 状态、订阅/在途批次/游标重启后持久化且语义不变、与既有
 GET /events 及任务接口并存且行为不变、OpenAPI 文档包含订阅接口）、
 可复用 DAG 模板（创建即发布版本 1、重名 409、创建/发布复用 DAG 图校验错误码

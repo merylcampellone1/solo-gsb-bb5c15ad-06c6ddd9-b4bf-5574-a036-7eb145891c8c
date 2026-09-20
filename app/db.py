@@ -205,6 +205,8 @@ def init_db(path: Path | None = None) -> None:
             -- 强制「同一订阅同时只允许一个未确认批次」。行内存本次批次的随机
             -- delivery_token、租约过期时刻、批次最后一条 sequence、事件条数与
             -- 首次响应原文（租约内重复 poll 逐字节回放）。ack 成功即删行；
+            -- ack 在推进游标的同一写事务内校验 lease_expires_at 仍晚于当前时刻
+            -- （相等也算到期 -> 409 delivery_expired，游标与本行均不变），
             -- 租约过期后的下次 poll 删旧行并以新令牌重新投递（游标仍停在
             -- committed_sequence，未确认事件会被原样重投，绝不跳过）。
             CREATE TABLE IF NOT EXISTS subscription_deliveries (

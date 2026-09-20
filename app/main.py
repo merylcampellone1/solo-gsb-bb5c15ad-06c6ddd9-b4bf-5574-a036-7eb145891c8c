@@ -259,7 +259,10 @@ def poll_subscription(subscription_id: str, body: SubscriptionPollIn):
     responses={
         200: {"description": "游标已推进到当前批次最后一条 sequence"},
         404: {"description": "订阅不存在（subscription_not_found）"},
-        409: {"description": "无在途批次（no_pending_batch）或令牌旧/错误（invalid_delivery_token）"},
+        409: {
+            "description": "无在途批次（no_pending_batch）、令牌旧/错误"
+            "（invalid_delivery_token）或投递租约已到期（delivery_expired，含边界相等）"
+        },
     },
 )
 def ack_subscription(subscription_id: str, body: SubscriptionAckIn) -> dict:

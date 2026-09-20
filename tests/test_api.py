@@ -2535,6 +2535,159 @@ def test_subscription_ack_rejects_wrong_missing_and_stale_tokens_without_advanci
     assert client.get(f"/subscriptions/{sid}").json()["committed_sequence"] == p["last_sequence"]
 
 
+def _freeze_clock(monkeypatch, start=None):
+    """把 service._now 固定为可控时钟：返回 {"now": dt}，测试中直接推进。"""
+    from app import service
+
+    clock = {"now": start or _utcnow()}
+    monkeypatch.setattr(service, "_now", lambda: clock["now"])
+    return clock
+
+
+def test_subscription_ack_after_expiry_returns_delivery_expired_without_change(client, monkeypatch):
+    """到期后、尚未再次 poll 的窗口里，当前令牌 ack 也必须 409 delivery_expired。
+
+    游标与在途记录均不变；下次 poll 删除旧批次并以新令牌重投同一窗口；
+    重投后旧令牌仍是 invalid_delivery_token，新令牌才能确认推进。
+    """
+    from datetime import timedelta
+
+    _run_dag_full(client, "sub-ackexp-1")
+    sid = client.post("/subscriptions", json={}).json()["id"]
+
+    t0 = _utcnow()
+    clock = _freeze_clock(monkeypatch, t0)
+
+    p = client.post(f"/subscriptions/{sid}/poll",
+                    json={"limit": 1, "lease_seconds": 10}).json()
+    token = p["delivery_token"]
+    first_seqs = [e["sequence"] for e in p["events"]]
+    assert _parse_iso(p["lease_expires_at"]) == t0 + timedelta(seconds=10)
+
+    # 租约到期（尚未再次 poll）：即便令牌正是当前在途批次的令牌也不得确认
+    clock["now"] = t0 + timedelta(seconds=10, milliseconds=1)
+    r = client.post(f"/subscriptions/{sid}/ack", json={"delivery_token": token})
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "delivery_expired"
+
+    # 游标不动、在途批次行原样保留（仍是同一令牌，详情标记 expired）
+    detail = client.get(f"/subscriptions/{sid}").json()
+    assert detail["committed_sequence"] == 0
+    inf = detail["in_flight"]
+    assert inf["delivery_token"] == token
+    assert inf["expired"] is True
+    assert inf["last_sequence"] == p["last_sequence"]
+
+    # 到期批次上连错误令牌语义也不变：仍优先返回 invalid_delivery_token
+    r = client.post(f"/subscriptions/{sid}/ack", json={"delivery_token": "wrong-token"})
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "invalid_delivery_token"
+    assert client.get(f"/subscriptions/{sid}").json()["committed_sequence"] == 0
+
+    # 下次 poll 删除旧批次、以新令牌重投同一窗口（游标仍停在 0）
+    p2 = client.post(f"/subscriptions/{sid}/poll",
+                     json={"limit": 50, "lease_seconds": 30}).json()
+    assert p2["delivery_token"] != token
+    assert [e["sequence"] for e in p2["events"]][:1] == first_seqs
+    assert p2["committed_sequence"] == 0
+
+    # 重投后旧令牌 -> invalid_delivery_token（旧 token 语义保持不变）
+    r = client.post(f"/subscriptions/{sid}/ack", json={"delivery_token": token})
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "invalid_delivery_token"
+    assert client.get(f"/subscriptions/{sid}").json()["committed_sequence"] == 0
+
+    # 新令牌在有效租约内确认成功，游标恰好推进到重投批次末尾
+    r = client.post(f"/subscriptions/{sid}/ack", json={"delivery_token": p2["delivery_token"]})
+    assert r.status_code == 200
+    assert r.json() == {
+        "subscription_id": sid,
+        "committed_sequence": p2["events"][-1]["sequence"],
+    }
+    assert client.get(f"/subscriptions/{sid}").json()["in_flight"] is None
+
+
+def test_subscription_ack_lease_boundary_equal_is_expired(client, monkeypatch):
+    """边界时刻：lease_expires_at 比当前时刻晚 1 微秒可确认；恰好相等即到期 409。"""
+    from datetime import timedelta
+
+    _run_dag_full(client, "sub-bound-1")
+
+    t0 = _utcnow()
+    clock = _freeze_clock(monkeypatch, t0)
+
+    # 订阅 A：到期前 1 微秒确认 —— 有效租约内确认语义不变
+    sid_a = client.post("/subscriptions", json={}).json()["id"]
+    pa = client.post(f"/subscriptions/{sid_a}/poll",
+                     json={"limit": 1, "lease_seconds": 10}).json()
+    expires_at = _parse_iso(pa["lease_expires_at"])
+    clock["now"] = expires_at - timedelta(microseconds=1)
+    r = client.post(f"/subscriptions/{sid_a}/ack",
+                    json={"delivery_token": pa["delivery_token"]})
+    assert r.status_code == 200
+    assert r.json()["committed_sequence"] == pa["last_sequence"]
+
+    # 订阅 B：时钟拨到与 lease_expires_at 恰好相等 —— 含边界相等也算到期
+    clock["now"] = t0
+    sid_b = client.post("/subscriptions", json={}).json()["id"]
+    pb = client.post(f"/subscriptions/{sid_b}/poll",
+                     json={"limit": 1, "lease_seconds": 10}).json()
+    token_b = pb["delivery_token"]
+    clock["now"] = _parse_iso(pb["lease_expires_at"])
+
+    # 详情视图在边界点同样标记 expired
+    assert client.get(f"/subscriptions/{sid_b}").json()["in_flight"]["expired"] is True
+
+    r = client.post(f"/subscriptions/{sid_b}/ack", json={"delivery_token": token_b})
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "delivery_expired"
+    detail = client.get(f"/subscriptions/{sid_b}").json()
+    assert detail["committed_sequence"] == 0
+    assert detail["in_flight"]["delivery_token"] == token_b
+
+    # 边界点 poll 也按到期处理：删旧批次、换新令牌重投同一窗口
+    p2 = client.post(f"/subscriptions/{sid_b}/poll",
+                     json={"limit": 50, "lease_seconds": 30}).json()
+    assert p2["delivery_token"] != token_b
+    assert p2["events"][0]["sequence"] == pb["events"][0]["sequence"]
+    r = client.post(f"/subscriptions/{sid_b}/ack",
+                    json={"delivery_token": p2["delivery_token"]})
+    assert r.status_code == 200
+    assert r.json()["committed_sequence"] == p2["events"][-1]["sequence"]
+
+
+def test_subscription_expired_ack_real_time_then_redeliver_and_ack(client):
+    """真实时钟端到端：短租约过期后 ack 被拒，poll 重投后新令牌确认成功。"""
+    _run_dag_full(client, "sub-ackexp-real-1")
+    sid = client.post("/subscriptions", json={}).json()["id"]
+
+    p = client.post(f"/subscriptions/{sid}/poll",
+                    json={"limit": 1, "lease_seconds": 0.2}).json()
+    token = p["delivery_token"]
+    first_seq = p["events"][0]["sequence"]
+
+    time.sleep(0.25)
+    r = client.post(f"/subscriptions/{sid}/ack", json={"delivery_token": token})
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "delivery_expired"
+    detail = client.get(f"/subscriptions/{sid}").json()
+    assert detail["committed_sequence"] == 0
+    assert detail["in_flight"]["delivery_token"] == token
+    assert detail["in_flight"]["expired"] is True
+
+    p2 = client.post(f"/subscriptions/{sid}/poll",
+                     json={"limit": 50, "lease_seconds": 30}).json()
+    assert p2["delivery_token"] != token
+    assert p2["events"][0]["sequence"] == first_seq
+
+    assert client.post(f"/subscriptions/{sid}/ack",
+                       json={"delivery_token": token}).status_code == 409
+    r = client.post(f"/subscriptions/{sid}/ack",
+                    json={"delivery_token": p2["delivery_token"]})
+    assert r.status_code == 200
+    assert r.json()["committed_sequence"] == p2["events"][-1]["sequence"]
+
+
 def test_subscription_cannot_skip_unacked_events(client):
     _run_dag_full(client, "sub-skip-1")
     sid = client.post("/subscriptions", json={}).json()["id"]

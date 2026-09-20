@@ -2123,11 +2123,18 @@ def poll_subscription(subscription_id: str, body: dict[str, Any]) -> dict[str, A
 def ack_subscription(subscription_id: str, body: dict[str, Any]) -> dict[str, Any]:
     """凭当前 delivery_token 确认在途批次，游标推进到该批最后一条 sequence。
 
-    仅接受在途批次的当前令牌：没有在途批次（从未投递、已确认或租约过期未重投）、
-    令牌旧（批次过期后已重新投递生成新令牌）或令牌错误一律 409，且游标保持不动——
-    游标只能推进到当前在途批次的最后一条，绝不可能越过任何未确认事件。
+    仅接受在途批次的当前令牌且租约仍有效：
+    - 没有在途批次（从未投递、已确认或租约过期未重投）一律 409 no_pending_batch；
+    - 令牌旧（批次过期后已重新投递生成新令牌）或令牌错误一律 409 invalid_delivery_token；
+    - 令牌正确但租约已到期（lease_expires_at <= 服务端当前时刻，边界相等也算到期）
+      一律 409 delivery_expired。
+
+    所有 409 路径都在同一写事务内校验并整体回滚：游标保持不动、在途批次行保持不变。
+    到期的批次留待下次 poll 删除并以新令牌重投，游标只能推进到当前在途批次的最后一条，
+    绝不可能越过任何未确认事件。
     """
     token = body["delivery_token"]
+    now = _now()
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -2147,6 +2154,17 @@ def ack_subscription(subscription_id: str, body: dict[str, Any]) -> dict[str, An
                     409,
                     "invalid_delivery_token",
                     "delivery_token 与当前在途批次不匹配（旧令牌或错误令牌）",
+                )
+            # 令牌正确也必须租约仍有效：到期后旧批次只允许由下次 poll 删除重投。
+            # 与任务租约一致采用包含边界的口径：lease_expires_at == 当前时刻即到期，
+            # 此时确认必须失败，否则本应重投的未确认事件会被直接跳过。
+            expires = _parse(delivery["lease_expires_at"])
+            if expires is not None and expires <= now:
+                raise APIError(
+                    409,
+                    "delivery_expired",
+                    f"投递租约已于 {delivery['lease_expires_at']} 过期，"
+                    "请重新 poll 取得新批次后再确认",
                 )
             # 游标只可能推进到该批最后一条 sequence；批次窗口从
             # committed_sequence 之后开始，天然不可能越过未确认事件
